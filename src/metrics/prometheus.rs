@@ -5,8 +5,14 @@ use metrics_exporter_prometheus::{BuildError, PrometheusBuilder};
 use crate::config::{PrometheusConfig, PrometheusMode};
 
 /// Initialize Prometheus metrics with the given configuration.
-pub(crate) fn init(config: &PrometheusConfig) -> Result<(), BuildError> {
+pub(crate) fn init(
+    config: &PrometheusConfig,
+    tags: &[(String, String)],
+) -> Result<(), BuildError> {
     let mut builder = PrometheusBuilder::new();
+    for (key, value) in tags {
+        builder = builder.add_global_label(key, value);
+    }
 
     builder = match config.mode {
         PrometheusMode::Http => builder.with_http_listener(config.listen),

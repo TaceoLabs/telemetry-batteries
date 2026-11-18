@@ -100,8 +100,10 @@ pub fn init_with_config(
             Some(tracing::stdout::init(log_format, &log_level))
         }
         TelemetryPreset::Datadog => {
-            let service_name =
-                config.service_name.as_deref().ok_or_else(|| {
+            let service_name = config
+                .tag("service")
+                .or(config.service_name.as_deref())
+                .ok_or_else(|| {
                     eyre::eyre!(
                         "TELEMETRY_SERVICE_NAME is required for Datadog preset"
                     )
@@ -112,6 +114,7 @@ pub fn init_with_config(
                 service_name,
                 log_format,
                 &log_level,
+                &config.tags,
             ))
         }
         TelemetryPreset::Otel => {
@@ -121,17 +124,24 @@ pub fn init_with_config(
     };
 
     // Initialize metrics based on backend
-    let metrics_handle = init_metrics(&config.metrics)?;
+    let metrics_handle = init_metrics(&config.metrics, &config.tags)?;
 
     Ok(TelemetryGuard::new(tracing_handle, metrics_handle))
 }
 
-fn init_metrics(config: &MetricsConfig) -> eyre::Result<MetricsHandle> {
+#[cfg_attr(
+    not(any(feature = "metrics-prometheus", feature = "metrics-statsd")),
+    expect(unused_variables)
+)]
+fn init_metrics(
+    config: &MetricsConfig,
+    tags: &[(String, String)],
+) -> eyre::Result<MetricsHandle> {
     match config.backend {
         MetricsBackend::Prometheus => {
             #[cfg(feature = "metrics-prometheus")]
             {
-                metrics::prometheus::init(&config.prometheus)?;
+                metrics::prometheus::init(&config.prometheus, tags)?;
             }
             #[cfg(not(feature = "metrics-prometheus"))]
             {
@@ -141,8 +151,15 @@ fn init_metrics(config: &MetricsConfig) -> eyre::Result<MetricsHandle> {
         MetricsBackend::Statsd => {
             #[cfg(feature = "metrics-statsd")]
             {
+                let statsd = StatsdConfig {
+                    default_tags: config::merge_tags(
+                        &config.statsd.default_tags,
+                        tags,
+                    ),
+                    ..config.statsd.clone()
+                };
                 return Ok(MetricsHandle {
-                    statsd: Some(metrics::statsd::init(&config.statsd)?),
+                    statsd: Some(metrics::statsd::init(&statsd)?),
                 });
             }
             #[cfg(not(feature = "metrics-statsd"))]

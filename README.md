@@ -63,6 +63,11 @@ Configuration is done via environment variables using **presets**:
 | `TELEMETRY_LOG_FORMAT` | `pretty`, `json`, `compact`, `datadog_json` | (from preset) |
 | `TELEMETRY_DATADOG_ENDPOINT` | url | `http://localhost:8126` |
 | `TELEMETRY_EYRE_MODE` | `color`, `json` | `color` |
+| `TELEMETRY_TAGS` | `key=value,key=value` | - |
+
+`TELEMETRY_TAGS` are added to every metric, span and `datadog_json` log line.
+The keys `service`, `env` and `version` take precedence over
+`TELEMETRY_SERVICE_NAME` and the `DD_*` variables.
 
 ### Metrics Configuration
 
