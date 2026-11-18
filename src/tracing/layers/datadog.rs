@@ -1,12 +1,14 @@
 use std::time::Duration;
 
 use chrono::Utc;
+use opentelemetry::KeyValue;
 use opentelemetry::trace::TracerProvider;
 #[expect(
     deprecated,
     reason = "no OTel-native Datadog exporter replacement yet"
 )]
 use opentelemetry_datadog::ApiVersion;
+use opentelemetry_sdk::Resource;
 use opentelemetry_sdk::runtime::Tokio;
 use opentelemetry_sdk::trace::span_processor_with_async_runtime::BatchSpanProcessor;
 use opentelemetry_sdk::trace::{
@@ -29,19 +31,21 @@ use crate::tracing::{
     WriteAdapter, opentelemetry_span_id, opentelemetry_trace_id,
 };
 
+/// Create a Datadog layer. `tags` are added to every span and `datadog_json` log line.
 pub fn datadog_layer<S>(
     service_name: &str,
     endpoint: &str,
     log_format: LogFormat,
+    tags: &[(String, String)],
 ) -> (impl Layer<S>, SdkTracerProvider)
 where
     S: Subscriber + for<'a> LookupSpan<'a>,
 {
-    let provider = datadog_provider(service_name, endpoint);
+    let provider = datadog_provider(service_name, endpoint, tags);
     // Use a static string for the tracer name since provider.tracer() requires 'static
     let tracer = provider.tracer("telemetry-batteries");
     let otel_layer = tracing_opentelemetry::OpenTelemetryLayer::new(tracer);
-    let format_layer = datadog_format_layer(log_format);
+    let format_layer = datadog_format_layer(log_format, tags);
 
     (format_layer.and_then(otel_layer), provider)
 }
@@ -55,16 +59,17 @@ pub fn datadog_layer_with_log_filter<S>(
     endpoint: &str,
     log_format: LogFormat,
     log_level: &str,
+    tags: &[(String, String)],
 ) -> (impl Layer<S>, SdkTracerProvider)
 where
     S: Subscriber + for<'a> LookupSpan<'a>,
 {
-    let provider = datadog_provider(service_name, endpoint);
+    let provider = datadog_provider(service_name, endpoint, tags);
     // Use a static string for the tracer name since provider.tracer() requires 'static
     let tracer = provider.tracer("telemetry-batteries");
     let otel_layer = tracing_opentelemetry::OpenTelemetryLayer::new(tracer);
-    let format_layer =
-        datadog_format_layer(log_format).with_filter(EnvFilter::new(log_level));
+    let format_layer = datadog_format_layer(log_format, tags)
+        .with_filter(EnvFilter::new(log_level));
 
     (format_layer.and_then(otel_layer), provider)
 }
@@ -73,7 +78,11 @@ where
     deprecated,
     reason = "no OTel-native Datadog exporter replacement yet"
 )]
-fn datadog_provider(service_name: &str, endpoint: &str) -> SdkTracerProvider {
+fn datadog_provider(
+    service_name: &str,
+    endpoint: &str,
+    tags: &[(String, String)],
+) -> SdkTracerProvider {
     // Small hack https://github.com/will-bank/datadog-tracing/blob/30cdfba8d00caa04f6ac8e304f76403a5eb97129/src/tracer.rs#L29
     // Until https://github.com/open-telemetry/opentelemetry-rust-contrib/issues/7 is resolved
     // seems to prevent client reuse and avoid the errors in question
@@ -87,11 +96,25 @@ fn datadog_provider(service_name: &str, endpoint: &str) -> SdkTracerProvider {
     // Build the exporter manually so we can use a tokio-based BatchSpanProcessor.
     // The default install_batch() spawns a thread without tokio runtime, which causes
     // reqwest to panic when doing DNS resolution.
-    let exporter = opentelemetry_datadog::new_pipeline()
+    let mut pipeline = opentelemetry_datadog::new_pipeline()
         .with_http_client(dd_http_client)
         .with_agent_endpoint(endpoint)
         .with_service_name(service_name)
-        .with_api_version(ApiVersion::Version05)
+        .with_api_version(ApiVersion::Version05);
+
+    // `env` and `version` have dedicated span fields and `service` is the service name;
+    // every other tag is a resource attribute, which the exporter writes to each span.
+    let mut attributes = Vec::new();
+    for (key, value) in tags {
+        match key.as_str() {
+            "service" => {}
+            "env" => pipeline = pipeline.with_env(value.clone()),
+            "version" => pipeline = pipeline.with_version(value.clone()),
+            _ => attributes.push(KeyValue::new(key.clone(), value.clone())),
+        }
+    }
+
+    let exporter = pipeline
         .build_exporter()
         .expect("failed to build OpenTelemetry datadog exporter");
 
@@ -120,6 +143,7 @@ fn datadog_provider(service_name: &str, endpoint: &str) -> SdkTracerProvider {
         .build();
 
     let provider = SdkTracerProvider::builder()
+        .with_resource(Resource::builder().with_attributes(attributes).build())
         .with_span_processor(batch_processor)
         .with_sampler(Sampler::AlwaysOn)
         .with_id_generator(ReducedIdGenerator)
@@ -134,17 +158,20 @@ fn datadog_provider(service_name: &str, endpoint: &str) -> SdkTracerProvider {
 /// Create a format layer for Datadog.
 ///
 /// If `log_format` is `DatadogJson`, uses the custom Datadog JSON format with trace correlation.
-/// Otherwise, uses the standard tracing-subscriber formats.
+/// Otherwise, uses the standard tracing-subscriber formats, which do not carry `tags`.
 pub fn datadog_format_layer<S>(
     log_format: LogFormat,
+    tags: &[(String, String)],
 ) -> Box<dyn Layer<S> + Send + Sync>
 where
     S: Subscriber + for<'a> LookupSpan<'a>,
 {
     match log_format {
-        LogFormat::DatadogJson => {
-            Box::new(fmt::Layer::new().json().event_format(DatadogFormat))
-        }
+        LogFormat::DatadogJson => Box::new(
+            fmt::Layer::new()
+                .json()
+                .event_format(DatadogFormat::with_tags(tags.to_vec())),
+        ),
         LogFormat::Pretty => Box::new(
             fmt::Layer::new()
                 .with_writer(std::io::stdout)
@@ -168,12 +195,23 @@ where
 /// Fields from ancestor spans (set via `#[instrument(fields(...))]` or
 /// `tracing::info_span!`) are flattened into each log line. Inner spans
 /// override outer spans, and event-level fields override all span fields.
+/// Static tags are written before the span fields.
 ///
 /// Output format:
 /// ```json
 /// {"timestamp":"...","level":"INFO","target":"my_app","request_id":"abc","message":"...","dd.trace_id":"123","dd.span_id":"456"}
 /// ```
-pub struct DatadogFormat;
+#[derive(Debug, Clone, Default)]
+pub struct DatadogFormat {
+    tags: Vec<(String, String)>,
+}
+
+impl DatadogFormat {
+    /// Format that adds `tags` as top-level fields to every log line.
+    pub fn with_tags(tags: Vec<(String, String)>) -> Self {
+        Self { tags }
+    }
+}
 
 impl<S, N> FormatEvent<S, N> for DatadogFormat
 where
@@ -203,6 +241,10 @@ where
                 .serialize_entry("timestamp", &Utc::now().to_rfc3339())?;
             serializer.serialize_entry("level", &meta.level().as_serde())?;
             serializer.serialize_entry("target", meta.target())?;
+
+            for (key, value) in &self.tags {
+                serializer.serialize_entry(key, value)?;
+            }
 
             // Propagate fields from ancestor spans (outer-to-inner).
             // Inner span fields override outer; event fields override all.
@@ -297,7 +339,7 @@ mod tests {
         let buf = BufWriter::new();
         let layer = fmt::Layer::new()
             .json()
-            .event_format(DatadogFormat)
+            .event_format(DatadogFormat::default())
             .with_writer(buf.clone());
 
         let subscriber = tracing_subscriber::registry().with(layer);
@@ -312,11 +354,35 @@ mod tests {
     }
 
     #[test]
+    fn test_tags_are_added_to_every_event() {
+        let buf = BufWriter::new();
+        let tags = vec![
+            ("env".to_owned(), "dev".to_owned()),
+            ("team".to_owned(), "core".to_owned()),
+        ];
+        let layer = fmt::Layer::new()
+            .json()
+            .event_format(DatadogFormat::with_tags(tags))
+            .with_writer(buf.clone());
+
+        let subscriber = tracing_subscriber::registry().with(layer);
+
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::info!("tagged event");
+        });
+
+        let log = parse_log_line(&buf.contents());
+        assert_eq!(log["message"], "tagged event");
+        assert_eq!(log["env"], "dev");
+        assert_eq!(log["team"], "core");
+    }
+
+    #[test]
     fn test_span_fields_propagated_to_event() {
         let buf = BufWriter::new();
         let layer = fmt::Layer::new()
             .json()
-            .event_format(DatadogFormat)
+            .event_format(DatadogFormat::default())
             .with_writer(buf.clone());
 
         let subscriber = tracing_subscriber::registry().with(layer);
@@ -337,7 +403,7 @@ mod tests {
         let buf = BufWriter::new();
         let layer = fmt::Layer::new()
             .json()
-            .event_format(DatadogFormat)
+            .event_format(DatadogFormat::default())
             .with_writer(buf.clone());
 
         let subscriber = tracing_subscriber::registry().with(layer);
@@ -370,7 +436,7 @@ mod tests {
         let buf = BufWriter::new();
         let layer = fmt::Layer::new()
             .json()
-            .event_format(DatadogFormat)
+            .event_format(DatadogFormat::default())
             .with_writer(buf.clone());
 
         let subscriber = tracing_subscriber::registry().with(layer);

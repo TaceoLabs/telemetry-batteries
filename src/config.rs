@@ -232,9 +232,25 @@ pub struct TelemetryConfig {
     /// Metrics configuration (independent from preset).
     #[builder(default)]
     pub metrics: MetricsConfig,
+
+    /// Tags added to every metric, span and `datadog_json` log line.
+    ///
+    /// `service`, `env` and `version` take precedence over `service_name` and the `DD_*`
+    /// variables.
+    #[builder(default)]
+    pub tags: Vec<(String, String)>,
 }
 
 impl TelemetryConfig {
+    /// Value of the given tag, if set.
+    pub fn tag(&self, key: &str) -> Option<&str> {
+        self.tags
+            .iter()
+            .rev()
+            .find(|(k, _)| k == key)
+            .map(|(_, v)| v.as_str())
+    }
+
     /// Get the effective log format based on preset and override.
     pub fn effective_log_format(&self) -> LogFormat {
         self.log_format.unwrap_or(match self.preset {
@@ -270,6 +286,11 @@ impl TelemetryConfig {
     /// | `TELEMETRY_LOG_FORMAT` | pretty/json/compact/datadog_json | (from preset) |
     /// | `TELEMETRY_DATADOG_ENDPOINT` | url | `http://localhost:8126` |
     /// | `TELEMETRY_OTLP_ENDPOINT` | url | `http://localhost:4317` |
+    /// | `TELEMETRY_TAGS` | `key=value,key=value` | - |
+    ///
+    /// `TELEMETRY_TAGS` are added to every metric, span and `datadog_json` log line. The keys
+    /// `service`, `env` and `version` take precedence over `TELEMETRY_SERVICE_NAME` and the
+    /// `DD_*` variables.
     ///
     /// ## Metrics configuration (independent from presets)
     ///
@@ -305,6 +326,12 @@ impl TelemetryConfig {
 
         let datadog_endpoint = env::var("TELEMETRY_DATADOG_ENDPOINT").ok();
         let otlp_endpoint = env::var("TELEMETRY_OTLP_ENDPOINT").ok();
+
+        let tags = env::var("TELEMETRY_TAGS")
+            .ok()
+            .map(|s| parse_tags(&s))
+            .transpose()?
+            .unwrap_or_default();
 
         // --- Metrics configuration ---
         let prometheus = PrometheusConfig {
@@ -377,8 +404,42 @@ impl TelemetryConfig {
             datadog_endpoint,
             otlp_endpoint,
             metrics,
+            tags,
         })
     }
+}
+
+/// Parse `key=value,key=value`. A repeated key keeps its last value.
+fn parse_tags(s: &str) -> eyre::Result<Vec<(String, String)>> {
+    let mut tags = Vec::new();
+    for pair in s.split(',').map(str::trim).filter(|pair| !pair.is_empty()) {
+        let (key, value) = pair
+            .split_once('=')
+            .map(|(key, value)| (key.trim(), value.trim()))
+            .filter(|(key, value)| !key.is_empty() && !value.is_empty())
+            .ok_or_else(|| {
+                eyre!(
+                    "invalid TELEMETRY_TAGS: expected 'key=value', got '{pair}'"
+                )
+            })?;
+        tags = merge_tags(&tags, &[(key.to_owned(), value.to_owned())]);
+    }
+    Ok(tags)
+}
+
+/// `base` with `overrides` applied: an existing key gets the new value, a new key is appended.
+pub(crate) fn merge_tags(
+    base: &[(String, String)],
+    overrides: &[(String, String)],
+) -> Vec<(String, String)> {
+    let mut merged = base.to_vec();
+    for (key, value) in overrides {
+        match merged.iter_mut().find(|(k, _)| k == key) {
+            Some(existing) => existing.1.clone_from(value),
+            None => merged.push((key.clone(), value.clone())),
+        }
+    }
+    merged
 }
 
 /// Datadog unified service tags and entity ID from the environment, skipping unset or empty ones.
@@ -407,6 +468,53 @@ fn statsd_default_tags(
     .into_iter()
     .filter_map(|(key, value)| Some((key.to_owned(), value?)))
     .collect()
+}
+
+#[cfg(test)]
+mod tag_tests {
+    use super::{merge_tags, parse_tags};
+
+    fn pairs(expected: &[(&str, &str)]) -> Vec<(String, String)> {
+        expected
+            .iter()
+            .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+            .collect()
+    }
+
+    #[test]
+    fn parses_pairs_and_trims_whitespace() {
+        assert_eq!(
+            parse_tags("env=dev, team = core ,url=a=b,").unwrap(),
+            pairs(&[("env", "dev"), ("team", "core"), ("url", "a=b")])
+        );
+        assert!(parse_tags("").unwrap().is_empty());
+    }
+
+    #[test]
+    fn repeated_key_keeps_last_value() {
+        assert_eq!(
+            parse_tags("env=dev,env=prod").unwrap(),
+            pairs(&[("env", "prod")])
+        );
+    }
+
+    #[test]
+    fn rejects_malformed_pairs() {
+        for input in ["env", "=dev", "env=", "env=dev,team"] {
+            assert!(parse_tags(input).is_err(), "{input}");
+        }
+    }
+
+    #[test]
+    fn merge_overrides_existing_keys_and_appends_new_ones() {
+        assert_eq!(
+            merge_tags(
+                &pairs(&[("service", "a"), ("env", "dev")]),
+                &pairs(&[("service", "b"), ("team", "core")]),
+            ),
+            pairs(&[("service", "b"), ("env", "dev"), ("team", "core")])
+        );
+    }
 }
 
 #[cfg(test)]

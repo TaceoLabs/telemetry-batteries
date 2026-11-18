@@ -25,6 +25,7 @@ pub(crate) fn init(
     service_name: &str,
     log_format: LogFormat,
     log_level: &str,
+    tags: &[(String, String)],
 ) -> TracingShutdownHandle {
     opentelemetry::global::set_text_map_propagator(DatadogPropagator::new());
 
@@ -35,6 +36,7 @@ pub(crate) fn init(
         endpoint,
         log_format,
         log_level,
+        tags,
     );
     tracing_subscriber::registry().with(dd_layer).init();
 

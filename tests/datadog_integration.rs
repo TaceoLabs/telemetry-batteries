@@ -104,7 +104,7 @@ fn datadog_logs_include_current_trace_and_span_ids() {
         );
     let format_layer = tracing_subscriber::fmt::Layer::new()
         .json()
-        .event_format(DatadogFormat)
+        .event_format(DatadogFormat::default())
         .with_writer(logs.clone());
     let subscriber =
         tracing_subscriber::registry().with(format_layer.and_then(otel_layer));
